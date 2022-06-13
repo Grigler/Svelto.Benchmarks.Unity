@@ -215,6 +215,7 @@ namespace Svelto.ECS
                                     fromEntityToEntityIDs, fromGroup, toGroup, toComponentsDictionary
                                   , enginesRoot._transientEntityIDsLeftAndAffectedByRemoval);
 
+                                using(sampler.Sample("Swap Between Persistent Filters"))
                                 //important: this must happen after the entities are swapped in the database
                                 enginesRoot.SwapEntityBetweenPersistentFilters(
                                     fromEntityToEntityIDs, fromComponentsDictionary, toComponentsDictionary, fromGroup

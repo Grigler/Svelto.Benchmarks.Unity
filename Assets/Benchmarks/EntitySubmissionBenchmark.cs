@@ -33,7 +33,7 @@ namespace Tests
                 using (Measure.Scope("add 1000 empty entities"))
                 {
                     for (uint i = 0; i < 1000; i++)
-                        entityFactory.BuildEntity<EntityDescriptor>(i, TestGroups.Group);
+                        entityFactory.BuildEntity<EmptyEntityDescriptor>(i, TestGroups.Group);
                 }
 
                 using (Measure.ProfilerMarkers(markers))
@@ -48,7 +48,7 @@ namespace Tests
                     enginesRoot   = new EnginesRoot(scheduler);
                     entityFactory = enginesRoot.GenerateEntityFactory();
                     
-                    entityFactory.PreallocateEntitySpace<EntityDescriptor>(TestGroups.Group, 1000);
+                    entityFactory.PreallocateEntitySpace<EmptyEntityDescriptor>(TestGroups.Group, 1000);
                     enginesRoot.Dispose();
                 }
                 ).Run();
@@ -58,7 +58,7 @@ namespace Tests
                 using (Measure.Scope("add 1000 empty entities over 10 groups"))
                 {
                     for (uint i = 0; i < 1000; i++)
-                        entityFactory.BuildEntity<EntityDescriptor>(i, TestGroups.Group + i % 10);
+                        entityFactory.BuildEntity<EmptyEntityDescriptor>(i, TestGroups.Group + i % 10);
                 }
                 
                 using (Measure.Scope("Add 1000 empty entities over 10 groups"))
@@ -71,11 +71,119 @@ namespace Tests
                     entityFactory = enginesRoot.GenerateEntityFactory();
                     
                     for (int i = 0; i < 10; i++)
-                        entityFactory.PreallocateEntitySpace<EntityDescriptor>(TestGroups.Group + (uint) i, 100);
+                        entityFactory.PreallocateEntitySpace<EmptyEntityDescriptor>(TestGroups.Group + (uint) i, 100);
                     enginesRoot.Dispose();                    
                 }
             ).Run();
         }
+
+
+        readonly SampleGroup[] submissionSampleGroups =
+        {
+            new SampleGroup("Add operations", SampleUnit.Millisecond),
+            new SampleGroup("Swap Entities", SampleUnit.Millisecond),
+            new SampleGroup("Swap Between Persistent Filters", SampleUnit.Millisecond),
+        };
+
+        [Test, Performance]
+        public void TestEntitySubmissionFilteredHeavy([Range(1000, 10000, 1000)] int max)
+        {
+            SimpleEntitiesSubmissionScheduler scheduler = new SimpleEntitiesSubmissionScheduler();
+
+            EnginesRoot      enginesRoot     = default;
+            IEntityFactory   entityFactory   = default;
+            IEntityFunctions entityFunctions = default;
+
+            var eng = new EntitiesDBAccessEngine();
+
+            Measure.Method(() =>
+            {
+                using (Measure.Scope($"Add {max} large entities across 10 groups"))
+                {
+                    for (uint i = 0; i < max; i++)
+                    {
+                        entityFactory.BuildEntity<PopulatedEntityDescriptor>(i, TestGroups.Group + i % 10);
+                    }
+                }
+
+                using (Measure.ProfilerMarkers(submissionSampleGroups))
+                {
+                    using (Measure.Scope("submit 1000 empty entities"))
+                    {
+                        scheduler.SubmitEntities();
+                    }
+                }
+                
+                using (Measure.Scope("Adding varying dense filters to entities"))
+                {
+                    var filters = eng.entitiesDB.GetFilters();
+
+                    for (var groupIndx = 0; groupIndx < 10; groupIndx++)
+                    {
+                        var group = (ExclusiveGroupStruct) (TestGroups.Group + (uint) groupIndx);
+
+                        var filterA =
+                            filters.GetOrCreatePersistentFilter<TestStruct1>(1,
+                                EntitiesDBAccessEngine.contextID);
+                        var filterB =
+                            filters.GetOrCreatePersistentFilter<TestStruct1>(2,
+                                EntitiesDBAccessEngine.contextID);
+                        var filterC =
+                            filters.GetOrCreatePersistentFilter<TestStruct1>(3,
+                                EntitiesDBAccessEngine.contextID);
+
+                        for (uint i = 0; i < max; i++)
+                        {
+                            if ((i + 1) % 2 == 0)
+                                filterA.Add(new EGID(i, group), i);
+
+                            if ((i + 1) % 4 == 0)
+                                filterB.Add(new EGID(i, group), i);
+
+                            if ((i + 1) % 8 == 0)
+                                filterC.Add(new EGID(i, group), i);
+                        }
+                    }
+                }
+
+                using (Measure.Scope($"Enqueuing {max/5} group swap operations"))
+                {
+                    var fromGroup = TestGroups.Group;
+                    var toGroup   = TestGroups.Group + 4;
+
+                    for (var i = 0; i < max/5; i++)
+                    {
+                        var entityID = (max / (max/5)) * i;
+
+                        entityFunctions.SwapEntityGroup<PopulatedEntityDescriptor>(new EGID((uint) entityID, fromGroup),
+                            toGroup);
+                    }
+                }
+
+                using (Measure.ProfilerMarkers(submissionSampleGroups))
+                {
+                    using (Measure.Scope("Submission"))
+                        scheduler.SubmitEntities();
+                }
+
+
+            }).WarmupCount(5).MeasurementCount(10).SetUp(() =>
+            {
+                enginesRoot = new EnginesRoot(scheduler);
+                entityFactory = enginesRoot.GenerateEntityFactory();
+                entityFunctions = enginesRoot.GenerateEntityFunctions();
+
+                for(uint groupIndx = 0; groupIndx < 10; groupIndx++)
+                    entityFactory.PreallocateEntitySpace<PopulatedEntityDescriptor>(TestGroups.Group + groupIndx, 10000);
+
+                enginesRoot.AddEngine(eng);
+            }).CleanUp((() =>
+            {
+                enginesRoot.Dispose();
+            })).Run();
+
+        }
+        
     }
 
     public class TestGroups
@@ -83,7 +191,103 @@ namespace Tests
         public static ExclusiveGroup Group = new ExclusiveGroup(10);
     }
 
-    public class EntityDescriptor: GenericEntityDescriptor<TestStruct> { }
+    public class EmptyEntityDescriptor: GenericEntityDescriptor<TestStruct> { }
 
     public struct TestStruct : IEntityComponent { }
+
+    public class EntitiesDBAccessEngine : IQueryingEntitiesEngine
+    {
+        public static FilterContextID contextID = FilterContextID.GetNewContextID();
+        
+        public void Ready()
+        {}
+
+        public EntitiesDB entitiesDB { get; set; }
+    }
+    
+    public class PopulatedEntityDescriptor : IEntityDescriptor
+    {
+        public IComponentBuilder[] componentsToBuild => _componentBuilders;
+
+        static IComponentBuilder[] _componentBuilders;
+        
+        static PopulatedEntityDescriptor()
+        {
+            _componentBuilders = new IComponentBuilder[]
+            {
+                new ComponentBuilder<TestStruct1>(),
+                new ComponentBuilder<TestStruct2>(),
+                new ComponentBuilder<TestStruct3>(),
+                new ComponentBuilder<TestStruct4>(),
+                new ComponentBuilder<TestStruct5>(),
+                new ComponentBuilder<TestStruct6>(),
+                new ComponentBuilder<TestStruct7>(),
+                new ComponentBuilder<TestStruct8>(),
+                new ComponentBuilder<TestStruct9>(),
+                new ComponentBuilder<TestStruct10>(),
+            };
+        }
+    }
+
+    public struct TestStruct1 : IEntityComponent
+    {
+        public float a;
+        public byte b;
+    }
+
+    public struct TestStruct2 : IEntityComponent
+    {
+        public uint a;
+        public uint b;
+        public uint c;
+    }
+
+    public struct TestStruct3 : IEntityComponent
+    {
+        public byte a;
+        public float b;
+    }
+
+    public struct TestStruct4 : IEntityComponent
+    {
+        public float a;
+        public float b;
+    }
+    
+    public struct TestStruct5 : IEntityComponent
+    {
+        public float a;
+        public byte b;
+    }
+
+    public struct TestStruct6 : IEntityComponent
+    {
+        public uint a;
+        public uint b;
+        public uint c;
+    }
+
+    public struct TestStruct7 : IEntityComponent
+    {
+        public byte a;
+        public float b;
+    }
+
+    public struct TestStruct8 : IEntityComponent
+    {
+        public float a;
+        public float b;
+    }
+    
+    public struct TestStruct9 : IEntityComponent
+    {
+        public byte a;
+        public float b;
+    }
+
+    public struct TestStruct10 : IEntityComponent
+    {
+        public float a;
+        public float b;
+    }
 }
